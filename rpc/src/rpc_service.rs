@@ -791,6 +791,9 @@ impl JsonRpcService {
             Arc::clone(&runtime),
         );
 
+        // Start background thread to pre-warm token largest accounts cache for popular mints
+        request_processor.start_token_cache_warmer();
+
         let _send_transaction_service = Arc::new(SendTransactionService::new_with_client(
             &bank_forks,
             receiver,

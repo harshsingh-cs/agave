@@ -448,6 +448,123 @@ impl JsonRpcRequestProcessor {
         )
     }
 
+    /// Spawn a background thread that pre-warms the token_largest_accounts_cache
+    /// for popular mints (USDC, USDT, etc.). This ensures that queries for these
+    /// high-holder-count mints always hit a warm cache and return instantly.
+    pub fn start_token_cache_warmer(&self) {
+        use solana_rpc_client_api::request::NUM_LARGEST_ACCOUNTS;
+        use std::thread;
+
+        // Popular mints to pre-warm (USDC, USDT)
+        let popular_mints: Vec<Pubkey> = vec![
+            // USDC
+            Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap(),
+            // USDT
+            Pubkey::from_str("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB").unwrap(),
+        ];
+
+        let use_indexed_scan = self
+            .config
+            .account_indexes
+            .contains(&AccountIndex::SplTokenMint);
+
+        if !use_indexed_scan {
+            info!("Token cache warmer: secondary index not enabled, skipping");
+            return;
+        }
+
+        let bank_forks = Arc::clone(&self.bank_forks);
+        let cache = Arc::clone(&self.token_largest_accounts_cache);
+        let account_indexes = self.config.account_indexes.clone();
+
+        thread::Builder::new()
+            .name("solTokCacheWarm".to_string())
+            .spawn(move || {
+                info!("Token cache warmer started for {} mints", popular_mints.len());
+                loop {
+                    for mint in &popular_mints {
+                        if !account_indexes.include_key(mint) {
+                            continue;
+                        }
+                        let bank = bank_forks.read().unwrap().root_bank();
+
+                        // Get mint owner and decimals
+                        let mint_info = match get_mint_owner_and_additional_data(&bank, mint) {
+                            Ok(info) => info,
+                            Err(e) => {
+                                warn!("Token cache warmer: failed to get mint info for {}: {}", mint, e);
+                                continue;
+                            }
+                        };
+                        let (mint_owner, data) = mint_info;
+
+                        if !is_known_spl_token_id(&mint_owner) {
+                            continue;
+                        }
+
+                        // Scan with heap-in-callback (same logic as get_token_largest_accounts)
+                        let mut heap = BinaryHeap::<Reverse<(u64, Pubkey)>>::with_capacity(
+                            NUM_LARGEST_ACCOUNTS,
+                        );
+                        let scan_result = bank.scan_indexed_accounts(
+                            &IndexKey::SplTokenMint(*mint),
+                            |pubkey, account| {
+                                if !account.owner().eq(&mint_owner)
+                                    || account.lamports() == 0
+                                    || account.data().is_empty()
+                                {
+                                    return;
+                                }
+                                let amount =
+                                    StateWithExtensions::<TokenAccount>::unpack(account.data())
+                                        .map(|a| a.base.amount)
+                                        .unwrap_or(0);
+                                let new_entry = (amount, *pubkey);
+                                if heap.len() >= NUM_LARGEST_ACCOUNTS {
+                                    if let Some(Reverse(entry)) = heap.peek() {
+                                        if *entry >= new_entry {
+                                            return;
+                                        }
+                                    }
+                                    heap.pop();
+                                }
+                                heap.push(Reverse(new_entry));
+                            },
+                            &ScanConfig::new(ScanOrder::Unsorted),
+                        );
+
+                        match scan_result {
+                            Ok(_) => {
+                                let token_balances: Vec<RpcTokenAccountBalance> = heap
+                                    .into_sorted_vec()
+                                    .into_iter()
+                                    .map(|Reverse((amount, address))| RpcTokenAccountBalance {
+                                        address: address.to_string(),
+                                        amount: token_amount_to_ui_amount_v3(amount, &data),
+                                    })
+                                    .collect();
+
+                                let slot = bank.slot();
+                                cache.write().unwrap().set(*mint, slot, &token_balances);
+                                info!(
+                                    "Token cache warmer: refreshed {} with {} accounts at slot {}",
+                                    mint,
+                                    token_balances.len(),
+                                    slot
+                                );
+                            }
+                            Err(e) => {
+                                warn!("Token cache warmer: scan failed for {}: {:?}", mint, e);
+                            }
+                        }
+                    }
+                    // Sleep for cache TTL before refreshing
+                    thread::sleep(Duration::from_secs(30));
+                }
+            })
+            .expect("Failed to spawn token cache warmer thread");
+    }
+
     #[cfg(test)]
     pub fn new_from_bank<Client: ClientWithCreator>(
         bank: Bank,
