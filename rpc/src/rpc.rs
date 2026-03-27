@@ -5,7 +5,9 @@ use {
     crate::{
         filter::filter_allows, max_slots::MaxSlots,
         optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank,
-        parsed_token_accounts::*, rpc_cache::LargestAccountsCache, rpc_health::*,
+        parsed_token_accounts::*,
+        rpc_cache::{LargestAccountsCache, TokenLargestAccountsCache},
+        rpc_health::*,
     },
     agave_snapshots::{paths as snapshot_paths, snapshot_config::SnapshotConfig},
     base64::{prelude::BASE64_STANDARD, Engine},
@@ -249,6 +251,7 @@ pub struct JsonRpcRequestProcessor {
     bigtable_ledger_storage: Option<solana_storage_bigtable::LedgerStorage>,
     optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
     largest_accounts_cache: Arc<RwLock<LargestAccountsCache>>,
+    token_largest_accounts_cache: Arc<RwLock<TokenLargestAccountsCache>>,
     max_slots: Arc<MaxSlots>,
     leader_schedule_cache: Arc<LeaderScheduleCache>,
     max_complete_transaction_status_slot: Arc<AtomicU64>,
@@ -434,6 +437,7 @@ impl JsonRpcRequestProcessor {
                 bigtable_ledger_storage,
                 optimistically_confirmed_bank,
                 largest_accounts_cache,
+                token_largest_accounts_cache: Arc::new(RwLock::new(TokenLargestAccountsCache::new(30))),
                 max_slots,
                 leader_schedule_cache,
                 max_complete_transaction_status_slot,
@@ -519,6 +523,7 @@ impl JsonRpcRequestProcessor {
             bigtable_ledger_storage: None,
             optimistically_confirmed_bank,
             largest_accounts_cache: Arc::new(RwLock::new(LargestAccountsCache::new(30))),
+            token_largest_accounts_cache: Arc::new(RwLock::new(TokenLargestAccountsCache::new(30))),
             max_slots: Arc::new(MaxSlots::default()),
             leader_schedule_cache,
             max_complete_transaction_status_slot: Arc::new(AtomicU64::default()),
@@ -2032,34 +2037,104 @@ impl JsonRpcRequestProcessor {
             ));
         }
 
-        let mut token_balances =
-            BinaryHeap::<Reverse<(u64, Pubkey)>>::with_capacity(NUM_LARGEST_ACCOUNTS);
-        for (address, account) in self
-            .get_filtered_spl_token_accounts_by_mint(
-                Arc::clone(&bank),
-                mint_owner,
-                mint,
-                vec![],
-                true,
-            )
-            .await?
+        // Check cache first - returns instantly for repeat queries
         {
-            let amount = StateWithExtensions::<TokenAccount>::unpack(account.data())
-                .map(|account| account.base.amount)
-                .unwrap_or(0);
-
-            let new_entry = (amount, address);
-            if token_balances.len() >= NUM_LARGEST_ACCOUNTS {
-                let Reverse(entry) = token_balances
-                    .peek()
-                    .expect("BinaryHeap::peek should succeed when len > 0");
-                if *entry >= new_entry {
-                    continue;
-                }
-                token_balances.pop();
+            let cache = self.token_largest_accounts_cache.read().unwrap();
+            if let Some((slot, accounts)) = cache.get(&mint) {
+                return Ok(RpcResponse {
+                    context: RpcResponseContext::new(slot),
+                    value: accounts,
+                });
             }
-            token_balances.push(Reverse(new_entry));
         }
+
+        // Cache miss: bypass the full Vec-collecting pipeline.
+        // Instead of loading ALL accounts into a Vec via get_filtered_spl_token_accounts_by_mint,
+        // use scan_indexed_accounts to visit each account in-place and maintain only a top-N heap.
+        // This reduces memory from O(all_accounts) to O(N) where N=20.
+        let use_indexed_scan = self
+            .config
+            .account_indexes
+            .contains(&AccountIndex::SplTokenMint)
+            && self.config.account_indexes.include_key(&mint);
+
+        let token_balances = if use_indexed_scan {
+            // Fast path: scan via secondary index with heap-in-callback
+            let bank_clone = Arc::clone(&bank);
+            let mint_clone = mint;
+            let mint_owner_clone = mint_owner;
+            self.runtime
+                .spawn_blocking(move || {
+                    let mut heap = BinaryHeap::<Reverse<(u64, Pubkey)>>::with_capacity(
+                        NUM_LARGEST_ACCOUNTS,
+                    );
+                    let scan_result = bank_clone.scan_indexed_accounts(
+                        &IndexKey::SplTokenMint(mint_clone),
+                        |pubkey, account| {
+                            // Replicate the filters from get_filtered_spl_token_accounts_by_mint:
+                            // 1. Owner must match the token program
+                            // 2. Account must be a valid token account (non-zero lamports)
+                            if !account.owner().eq(&mint_owner_clone)
+                                || account.lamports() == 0
+                                || account.data().is_empty()
+                            {
+                                return;
+                            }
+                            let amount =
+                                StateWithExtensions::<TokenAccount>::unpack(account.data())
+                                    .map(|a| a.base.amount)
+                                    .unwrap_or(0);
+                            let new_entry = (amount, *pubkey);
+                            if heap.len() >= NUM_LARGEST_ACCOUNTS {
+                                if let Some(Reverse(entry)) = heap.peek() {
+                                    if *entry >= new_entry {
+                                        return;
+                                    }
+                                }
+                                heap.pop();
+                            }
+                            heap.push(Reverse(new_entry));
+                        },
+                        &ScanConfig::new(ScanOrder::Unsorted),
+                    );
+                    scan_result.map(|_| heap)
+                })
+                .await
+                .expect("Failed to spawn blocking task")
+                .map_err(|e| {
+                    Error::invalid_params(format!("Scan error: {e}"))
+                })?
+        } else {
+            // Fallback: no secondary index, use the original pipeline
+            let mut heap =
+                BinaryHeap::<Reverse<(u64, Pubkey)>>::with_capacity(NUM_LARGEST_ACCOUNTS);
+            for (address, account) in self
+                .get_filtered_spl_token_accounts_by_mint(
+                    Arc::clone(&bank),
+                    mint_owner,
+                    mint,
+                    vec![],
+                    true,
+                )
+                .await?
+            {
+                let amount = StateWithExtensions::<TokenAccount>::unpack(account.data())
+                    .map(|account| account.base.amount)
+                    .unwrap_or(0);
+                let new_entry = (amount, address);
+                if heap.len() >= NUM_LARGEST_ACCOUNTS {
+                    let Reverse(entry) = heap
+                        .peek()
+                        .expect("BinaryHeap::peek should succeed when len > 0");
+                    if *entry >= new_entry {
+                        continue;
+                    }
+                    heap.pop();
+                }
+                heap.push(Reverse(new_entry));
+            }
+            heap
+        };
 
         let token_balances = token_balances
             .into_sorted_vec()
@@ -2071,6 +2146,12 @@ impl JsonRpcRequestProcessor {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+
+        // Cache the result for subsequent queries
+        {
+            let mut cache = self.token_largest_accounts_cache.write().unwrap();
+            cache.set(mint, bank.slot(), &token_balances);
+        }
 
         Ok(new_response(&bank, token_balances))
     }
@@ -4837,6 +4918,7 @@ pub mod tests {
                 None,
                 optimistically_confirmed_bank,
                 Arc::new(RwLock::new(LargestAccountsCache::new(30))),
+                Arc::new(RwLock::new(TokenLargestAccountsCache::new(30))),
                 max_slots.clone(),
                 Arc::new(LeaderScheduleCache::new_from_bank(&bank)),
                 max_complete_transaction_status_slot.clone(),
@@ -6891,6 +6973,7 @@ pub mod tests {
             None,
             optimistically_confirmed_bank,
             Arc::new(RwLock::new(LargestAccountsCache::new(30))),
+            Arc::new(RwLock::new(TokenLargestAccountsCache::new(30))),
             Arc::new(MaxSlots::default()),
             Arc::new(LeaderScheduleCache::default()),
             Arc::new(AtomicU64::default()),
@@ -7218,6 +7301,7 @@ pub mod tests {
             None,
             optimistically_confirmed_bank,
             Arc::new(RwLock::new(LargestAccountsCache::new(30))),
+            Arc::new(RwLock::new(TokenLargestAccountsCache::new(30))),
             Arc::new(MaxSlots::default()),
             Arc::new(LeaderScheduleCache::default()),
             Arc::new(AtomicU64::default()),
@@ -8970,6 +9054,7 @@ pub mod tests {
             None,
             optimistically_confirmed_bank.clone(),
             Arc::new(RwLock::new(LargestAccountsCache::new(30))),
+            Arc::new(RwLock::new(TokenLargestAccountsCache::new(30))),
             Arc::new(MaxSlots::default()),
             Arc::new(LeaderScheduleCache::default()),
             max_complete_transaction_status_slot,

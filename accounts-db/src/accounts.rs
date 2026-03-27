@@ -440,6 +440,34 @@ impl Accounts {
         Self::maybe_abort_scan(result, &config)
     }
 
+    /// Scan indexed accounts by key, calling `account_visitor` for each matching account.
+    /// Unlike `load_by_index_key_with_filter`, this does NOT collect accounts into a Vec.
+    /// Each account is visited and immediately dropped, keeping memory usage constant.
+    /// Ideal for aggregation queries like getTokenLargestAccounts.
+    pub fn scan_by_index_key<F: FnMut(&Pubkey, &AccountSharedData)>(
+        &self,
+        ancestors: &Ancestors,
+        bank_id: BankId,
+        index_key: &IndexKey,
+        mut account_visitor: F,
+        config: &ScanConfig,
+    ) -> ScanResult<()> {
+        let config = config.recreate_with_abort();
+        self.accounts_db
+            .index_scan_accounts(
+                ancestors,
+                bank_id,
+                *index_key,
+                |some_account_tuple| {
+                    if let Some((pubkey, account, _slot)) = some_account_tuple {
+                        account_visitor(pubkey, &account);
+                    }
+                },
+                &config,
+            )
+            .map(|_| ())
+    }
+
     pub fn account_indexes_include_key(&self, key: &Pubkey) -> bool {
         self.accounts_db.account_indexes.include_key(key)
     }
