@@ -1,5 +1,9 @@
 use {
-    solana_rpc_client_api::{config::RpcLargestAccountsFilter, response::RpcAccountBalance},
+    solana_pubkey::Pubkey,
+    solana_rpc_client_api::{
+        config::RpcLargestAccountsFilter,
+        response::{RpcAccountBalance, RpcTokenAccountBalance},
+    },
     std::{
         collections::HashMap,
         time::{Duration, SystemTime},
@@ -50,6 +54,58 @@ impl LargestAccountsCache {
         self.cache.insert(
             filter.clone(),
             LargestAccountsCacheValue {
+                accounts: accounts.to_owned(),
+                slot,
+                cached_time: SystemTime::now(),
+            },
+        );
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenLargestAccountsCache {
+    duration: u64,
+    cache: HashMap<Pubkey, TokenLargestAccountsCacheValue>,
+}
+
+#[derive(Debug, Clone)]
+struct TokenLargestAccountsCacheValue {
+    accounts: Vec<RpcTokenAccountBalance>,
+    slot: u64,
+    cached_time: SystemTime,
+}
+
+impl TokenLargestAccountsCache {
+    pub(crate) fn new(duration: u64) -> Self {
+        Self {
+            duration,
+            cache: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn get(
+        &self,
+        mint: &Pubkey,
+    ) -> Option<(u64, Vec<RpcTokenAccountBalance>)> {
+        self.cache.get(mint).and_then(|value| {
+            if let Ok(elapsed) = value.cached_time.elapsed() {
+                if elapsed < Duration::from_secs(self.duration) {
+                    return Some((value.slot, value.accounts.clone()));
+                }
+            }
+            None
+        })
+    }
+
+    pub(crate) fn set(
+        &mut self,
+        mint: Pubkey,
+        slot: u64,
+        accounts: &[RpcTokenAccountBalance],
+    ) {
+        self.cache.insert(
+            mint,
+            TokenLargestAccountsCacheValue {
                 accounts: accounts.to_owned(),
                 slot,
                 cached_time: SystemTime::now(),

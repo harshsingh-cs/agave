@@ -4607,6 +4607,25 @@ impl Bank {
         )
     }
 
+    /// Scan indexed accounts by key, calling `account_visitor` for each matching account.
+    /// Unlike `get_filtered_indexed_accounts`, this does NOT collect accounts into a Vec.
+    /// Each account is visited in-place and immediately dropped, keeping memory constant.
+    /// Used by getTokenLargestAccounts to find top-N without loading all accounts into memory.
+    pub fn scan_indexed_accounts<F: FnMut(&Pubkey, &AccountSharedData)>(
+        &self,
+        index_key: &IndexKey,
+        account_visitor: F,
+        config: &ScanConfig,
+    ) -> ScanResult<()> {
+        self.rc.accounts.scan_by_index_key(
+            &self.ancestors,
+            self.bank_id,
+            index_key,
+            account_visitor,
+            config,
+        )
+    }
+
     pub fn account_indexes_include_key(&self, key: &Pubkey) -> bool {
         self.rc.accounts.account_indexes_include_key(key)
     }
