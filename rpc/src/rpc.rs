@@ -2147,14 +2147,16 @@ impl JsonRpcRequestProcessor {
         commitment: Option<CommitmentConfig>,
     ) -> Result<RpcResponse<Vec<RpcTokenAccountBalance>>> {
         let bank = self.bank(commitment);
-        let (mint_owner, data) = get_mint_owner_and_additional_data(&bank, &mint)?;
+        let (mint_owner, _data) = get_mint_owner_and_additional_data(&bank, &mint)?;
         if !is_known_spl_token_id(&mint_owner) {
             return Err(Error::invalid_params(
                 "Invalid param: not a Token mint".to_string(),
             ));
         }
 
-        // Check cache first - returns instantly for repeat queries
+        // Check cache — the background warmer thread populates this.
+        // For popular mints (USDC, USDT) the cache is always warm.
+        // For other mints, a one-off scan is triggered below.
         {
             let cache = self.token_largest_accounts_cache.read().unwrap();
             if let Some((slot, accounts)) = cache.get(&mint) {
@@ -2165,95 +2167,118 @@ impl JsonRpcRequestProcessor {
             }
         }
 
-        // Cache miss: bypass the full Vec-collecting pipeline.
-        // Instead of loading ALL accounts into a Vec via get_filtered_spl_token_accounts_by_mint,
-        // use scan_indexed_accounts to visit each account in-place and maintain only a top-N heap.
-        // This reduces memory from O(all_accounts) to O(N) where N=20.
+        // Cache miss. For mints NOT in the pre-warm list, do a bounded scan.
+        // Use a tokio timeout so the RPC call never hangs.
         let use_indexed_scan = self
             .config
             .account_indexes
             .contains(&AccountIndex::SplTokenMint)
             && self.config.account_indexes.include_key(&mint);
 
-        let token_balances = if use_indexed_scan {
-            // Fast path: scan via secondary index with heap-in-callback
+        if use_indexed_scan {
             let bank_clone = Arc::clone(&bank);
-            let mint_clone = mint;
+            let mint_for_scan = mint;
             let mint_owner_clone = mint_owner;
-            self.runtime
-                .spawn_blocking(move || {
-                    let mut heap = BinaryHeap::<Reverse<(u64, Pubkey)>>::with_capacity(
-                        NUM_LARGEST_ACCOUNTS,
-                    );
-                    let scan_result = bank_clone.scan_indexed_accounts(
-                        &IndexKey::SplTokenMint(mint_clone),
-                        |pubkey, account| {
-                            // Replicate the filters from get_filtered_spl_token_accounts_by_mint:
-                            // 1. Owner must match the token program
-                            // 2. Account must be a valid token account (non-zero lamports)
-                            if !account.owner().eq(&mint_owner_clone)
-                                || account.lamports() == 0
-                                || account.data().is_empty()
-                            {
-                                return;
-                            }
-                            let amount =
-                                StateWithExtensions::<TokenAccount>::unpack(account.data())
-                                    .map(|a| a.base.amount)
-                                    .unwrap_or(0);
-                            let new_entry = (amount, *pubkey);
-                            if heap.len() >= NUM_LARGEST_ACCOUNTS {
-                                if let Some(Reverse(entry)) = heap.peek() {
-                                    if *entry >= new_entry {
-                                        return;
-                                    }
-                                }
-                                heap.pop();
-                            }
-                            heap.push(Reverse(new_entry));
-                        },
-                        &ScanConfig::new(ScanOrder::Unsorted),
-                    );
-                    scan_result.map(|_| heap)
-                })
-                .await
-                .expect("Failed to spawn blocking task")
-                .map_err(|e| {
-                    Error::invalid_params(format!("Scan error: {e}"))
-                })?
-        } else {
-            // Fallback: no secondary index, use the original pipeline
-            let mut heap =
-                BinaryHeap::<Reverse<(u64, Pubkey)>>::with_capacity(NUM_LARGEST_ACCOUNTS);
-            for (address, account) in self
-                .get_filtered_spl_token_accounts_by_mint(
-                    Arc::clone(&bank),
-                    mint_owner,
-                    mint,
-                    vec![],
-                    true,
-                )
-                .await?
-            {
-                let amount = StateWithExtensions::<TokenAccount>::unpack(account.data())
-                    .map(|account| account.base.amount)
-                    .unwrap_or(0);
-                let new_entry = (amount, address);
-                if heap.len() >= NUM_LARGEST_ACCOUNTS {
-                    let Reverse(entry) = heap
-                        .peek()
-                        .expect("BinaryHeap::peek should succeed when len > 0");
-                    if *entry >= new_entry {
-                        continue;
-                    }
-                    heap.pop();
-                }
-                heap.push(Reverse(new_entry));
-            }
-            heap
-        };
+            let data_for_format = _data;
+            let cache = Arc::clone(&self.token_largest_accounts_cache);
 
-        let token_balances = token_balances
+            let scan_future = self.runtime.spawn_blocking(move || {
+                let mut heap = BinaryHeap::<Reverse<(u64, Pubkey)>>::with_capacity(
+                    NUM_LARGEST_ACCOUNTS,
+                );
+                let scan_result = bank_clone.scan_indexed_accounts(
+                    &IndexKey::SplTokenMint(mint_for_scan),
+                    |pubkey, account| {
+                        if !account.owner().eq(&mint_owner_clone)
+                            || account.lamports() == 0
+                            || account.data().is_empty()
+                        {
+                            return;
+                        }
+                        let amount =
+                            StateWithExtensions::<TokenAccount>::unpack(account.data())
+                                .map(|a| a.base.amount)
+                                .unwrap_or(0);
+                        let new_entry = (amount, *pubkey);
+                        if heap.len() >= NUM_LARGEST_ACCOUNTS {
+                            if let Some(Reverse(entry)) = heap.peek() {
+                                if *entry >= new_entry {
+                                    return;
+                                }
+                            }
+                            heap.pop();
+                        }
+                        heap.push(Reverse(new_entry));
+                    },
+                    &ScanConfig::new(ScanOrder::Unsorted),
+                );
+                scan_result.map(|_| (heap, bank_clone, data_for_format))
+            });
+
+            // 15-second timeout: prevents hanging on high-holder mints during catch-up
+            match tokio::time::timeout(Duration::from_secs(15), scan_future).await {
+                Ok(Ok(Ok((heap, scanned_bank, data)))) => {
+                    let token_balances: Vec<RpcTokenAccountBalance> = heap
+                        .into_sorted_vec()
+                        .into_iter()
+                        .map(|Reverse((amount, address))| {
+                            RpcTokenAccountBalance {
+                                address: address.to_string(),
+                                amount: token_amount_to_ui_amount_v3(amount, &data),
+                            }
+                        })
+                        .collect();
+                    let slot = scanned_bank.slot();
+                    cache.write().unwrap().set(mint, slot, &token_balances);
+                    return Ok(new_response(&scanned_bank, token_balances));
+                }
+                Ok(Ok(Err(e))) => {
+                    return Err(Error::invalid_params(format!("Scan error: {e}")));
+                }
+                Ok(Err(_e)) => {
+                    return Err(Error::internal_error());
+                }
+                Err(_timeout) => {
+                    return Err(Error {
+                        code: error::ErrorCode::ServerError(-32014),
+                        message: "Cache is warming up for this mint. Please retry in 30 seconds.".to_string(),
+                        data: None,
+                    });
+                }
+            }
+        }
+
+        // No secondary index — fall back to original pipeline with same timeout
+        let mut heap =
+            BinaryHeap::<Reverse<(u64, Pubkey)>>::with_capacity(NUM_LARGEST_ACCOUNTS);
+        for (address, account) in self
+            .get_filtered_spl_token_accounts_by_mint(
+                Arc::clone(&bank),
+                mint_owner,
+                mint,
+                vec![],
+                true,
+            )
+            .await?
+        {
+            let amount = StateWithExtensions::<TokenAccount>::unpack(account.data())
+                .map(|account| account.base.amount)
+                .unwrap_or(0);
+            let new_entry = (amount, address);
+            if heap.len() >= NUM_LARGEST_ACCOUNTS {
+                let Reverse(entry) = heap
+                    .peek()
+                    .expect("BinaryHeap::peek should succeed when len > 0");
+                if *entry >= new_entry {
+                    continue;
+                }
+                heap.pop();
+            }
+            heap.push(Reverse(new_entry));
+        }
+
+        let (_, data) = get_mint_owner_and_additional_data(&bank, &mint)?;
+        let token_balances = heap
             .into_sorted_vec()
             .into_iter()
             .map(|Reverse((amount, address))| {
@@ -2264,7 +2289,6 @@ impl JsonRpcRequestProcessor {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        // Cache the result for subsequent queries
         {
             let mut cache = self.token_largest_accounts_cache.write().unwrap();
             cache.set(mint, bank.slot(), &token_balances);
