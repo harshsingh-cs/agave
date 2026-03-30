@@ -457,6 +457,7 @@ impl JsonRpcRequestProcessor {
     pub fn start_token_cache_warmer(&self) {
         use solana_rpc_client_api::request::NUM_LARGEST_ACCOUNTS;
         use std::thread;
+        use std::time::Duration;
 
         const PARALLEL_THREADS: usize = 16;
 
@@ -507,12 +508,28 @@ impl JsonRpcRequestProcessor {
         let bank_forks = Arc::clone(&self.bank_forks);
         let cache = Arc::clone(&self.token_largest_accounts_cache);
         let account_indexes = self.config.account_indexes.clone();
+        let health = Arc::clone(&self.health);
 
         thread::Builder::new()
             .name("solTokCacheWarm".to_string())
             .spawn(move || {
-                info!("Token cache warmer started for {} mints (parallel mode, {} threads)",
-                    popular_mints.len(), PARALLEL_THREADS);
+                info!("Token cache warmer: waiting for node to finish syncing before starting...");
+                loop {
+                    match health.check() {
+                        RpcHealthStatus::Ok => {
+                            info!("Token cache warmer: node is synced, starting cache warming for {} mints ({} threads)",
+                                popular_mints.len(), PARALLEL_THREADS);
+                            break;
+                        }
+                        RpcHealthStatus::Behind { num_slots } => {
+                            info!("Token cache warmer: node is behind by {} slots, waiting...", num_slots);
+                        }
+                        RpcHealthStatus::Unknown => {
+                            info!("Token cache warmer: node health unknown, waiting...");
+                        }
+                    }
+                    thread::sleep(Duration::from_secs(30));
+                }
                 loop {
                     for mint in &popular_mints {
                         if !account_indexes.include_key(mint) {
