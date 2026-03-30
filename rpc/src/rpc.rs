@@ -437,7 +437,7 @@ impl JsonRpcRequestProcessor {
                 bigtable_ledger_storage,
                 optimistically_confirmed_bank,
                 largest_accounts_cache,
-                token_largest_accounts_cache: Arc::new(RwLock::new(TokenLargestAccountsCache::new(30))),
+                token_largest_accounts_cache: Arc::new(RwLock::new(TokenLargestAccountsCache::new(600))),
                 max_slots,
                 leader_schedule_cache,
                 max_complete_transaction_status_slot,
