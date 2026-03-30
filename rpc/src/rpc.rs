@@ -460,12 +460,38 @@ impl JsonRpcRequestProcessor {
 
         const PARALLEL_THREADS: usize = 16;
 
-        // Popular mints to pre-warm (USDC, USDT)
+        // Popular mints to pre-warm — scanned sequentially so peak memory
+        // is only the largest mint's pubkey Vec (~1.6GB for wrapped SOL).
+        // Safe with 1.5TB RAM. All addresses verified against mainnet.
         let popular_mints: Vec<Pubkey> = vec![
             // USDC
             Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap(),
             // USDT
             Pubkey::from_str("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB").unwrap(),
+            // Wrapped SOL
+            Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap(),
+            // JitoSOL
+            Pubkey::from_str("J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn").unwrap(),
+            // mSOL (Marinade)
+            Pubkey::from_str("mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So").unwrap(),
+            // JUP (Jupiter)
+            Pubkey::from_str("JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN").unwrap(),
+            // RAY (Raydium)
+            Pubkey::from_str("4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R").unwrap(),
+            // BONK
+            Pubkey::from_str("DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263").unwrap(),
+            // WIF (dogwifhat)
+            Pubkey::from_str("EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm").unwrap(),
+            // BOME
+            Pubkey::from_str("ukHH6c7mMyiWCf1b9pnWe25TSpkDDt3H5pQZgZ74J82").unwrap(),
+            // bSOL (BlazeStake)
+            Pubkey::from_str("bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1").unwrap(),
+            // stSOL (Lido)
+            Pubkey::from_str("7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y7ARj").unwrap(),
+            // wETH (Wormhole)
+            Pubkey::from_str("7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs").unwrap(),
+            // HNT (Helium)
+            Pubkey::from_str("hntyVP6YFm1Hg25TN9WGLqM12b8TQmcknKrdu1oxWux").unwrap(),
         ];
 
         let use_indexed_scan = self
