@@ -451,9 +451,14 @@ impl JsonRpcRequestProcessor {
     /// Spawn a background thread that pre-warms the token_largest_accounts_cache
     /// for popular mints (USDC, USDT, etc.). This ensures that queries for these
     /// high-holder-count mints always hit a warm cache and return instantly.
+    ///
+    /// Uses parallel account loading: gets pubkeys from the secondary index (fast,
+    /// in-memory), then loads accounts across multiple threads to saturate disk I/O.
     pub fn start_token_cache_warmer(&self) {
         use solana_rpc_client_api::request::NUM_LARGEST_ACCOUNTS;
         use std::thread;
+
+        const PARALLEL_THREADS: usize = 16;
 
         // Popular mints to pre-warm (USDC, USDT)
         let popular_mints: Vec<Pubkey> = vec![
@@ -480,7 +485,8 @@ impl JsonRpcRequestProcessor {
         thread::Builder::new()
             .name("solTokCacheWarm".to_string())
             .spawn(move || {
-                info!("Token cache warmer started for {} mints", popular_mints.len());
+                info!("Token cache warmer started for {} mints (parallel mode, {} threads)",
+                    popular_mints.len(), PARALLEL_THREADS);
                 loop {
                     for mint in &popular_mints {
                         if !account_indexes.include_key(mint) {
@@ -502,61 +508,101 @@ impl JsonRpcRequestProcessor {
                             continue;
                         }
 
-                        // Scan with heap-in-callback (same logic as get_token_largest_accounts)
-                        let mut heap = BinaryHeap::<Reverse<(u64, Pubkey)>>::with_capacity(
+                        // Phase 1: Get all pubkeys from secondary index (fast, in-memory)
+                        let pubkeys = bank.rc.accounts.accounts_db.accounts_index
+                            .get_indexed_keys(&IndexKey::SplTokenMint(*mint));
+
+                        info!("Token cache warmer: scanning {} accounts for {} ({} threads)",
+                            pubkeys.len(), mint, PARALLEL_THREADS);
+
+                        // Phase 2: Load accounts in parallel and find top-N
+                        let chunk_size = (pubkeys.len() + PARALLEL_THREADS - 1) / PARALLEL_THREADS;
+                        if chunk_size == 0 {
+                            info!("Token cache warmer: no accounts for {}", mint);
+                            continue;
+                        }
+
+                        let mut global_heap = BinaryHeap::<Reverse<(u64, Pubkey)>>::with_capacity(
                             NUM_LARGEST_ACCOUNTS,
                         );
-                        let scan_result = bank.scan_indexed_accounts(
-                            &IndexKey::SplTokenMint(*mint),
-                            |pubkey, account| {
-                                if !account.owner().eq(&mint_owner)
-                                    || account.lamports() == 0
-                                    || account.data().is_empty()
-                                {
-                                    return;
-                                }
-                                let amount =
-                                    StateWithExtensions::<TokenAccount>::unpack(account.data())
-                                        .map(|a| a.base.amount)
-                                        .unwrap_or(0);
-                                let new_entry = (amount, *pubkey);
-                                if heap.len() >= NUM_LARGEST_ACCOUNTS {
-                                    if let Some(Reverse(entry)) = heap.peek() {
-                                        if *entry >= new_entry {
-                                            return;
+
+                        thread::scope(|s| {
+                            let handles: Vec<_> = pubkeys
+                                .chunks(chunk_size)
+                                .map(|chunk| {
+                                    let bank_ref = &bank;
+                                    let mint_owner_ref = &mint_owner;
+                                    s.spawn(move || {
+                                        let mut local_heap = BinaryHeap::<Reverse<(u64, Pubkey)>>::with_capacity(
+                                            NUM_LARGEST_ACCOUNTS,
+                                        );
+                                        for pubkey in chunk {
+                                            let account = match bank_ref.get_account(pubkey) {
+                                                Some(a) => a,
+                                                None => continue,
+                                            };
+                                            if !account.owner().eq(mint_owner_ref)
+                                                || account.lamports() == 0
+                                                || account.data().is_empty()
+                                            {
+                                                continue;
+                                            }
+                                            let amount = StateWithExtensions::<TokenAccount>::unpack(
+                                                account.data(),
+                                            )
+                                            .map(|a| a.base.amount)
+                                            .unwrap_or(0);
+                                            let new_entry = (amount, *pubkey);
+                                            if local_heap.len() >= NUM_LARGEST_ACCOUNTS {
+                                                if let Some(Reverse(entry)) = local_heap.peek() {
+                                                    if *entry >= new_entry {
+                                                        continue;
+                                                    }
+                                                }
+                                                local_heap.pop();
+                                            }
+                                            local_heap.push(Reverse(new_entry));
                                         }
-                                    }
-                                    heap.pop();
-                                }
-                                heap.push(Reverse(new_entry));
-                            },
-                            &ScanConfig::new(ScanOrder::Unsorted),
-                        );
-
-                        match scan_result {
-                            Ok(_) => {
-                                let token_balances: Vec<RpcTokenAccountBalance> = heap
-                                    .into_sorted_vec()
-                                    .into_iter()
-                                    .map(|Reverse((amount, address))| RpcTokenAccountBalance {
-                                        address: address.to_string(),
-                                        amount: token_amount_to_ui_amount_v3(amount, &data),
+                                        local_heap
                                     })
-                                    .collect();
+                                })
+                                .collect();
 
-                                let slot = bank.slot();
-                                cache.write().unwrap().set(*mint, slot, &token_balances);
-                                info!(
-                                    "Token cache warmer: refreshed {} with {} accounts at slot {}",
-                                    mint,
-                                    token_balances.len(),
-                                    slot
-                                );
+                            // Merge all local heaps into the global heap
+                            for handle in handles {
+                                let local_heap = handle.join().unwrap();
+                                for entry in local_heap {
+                                    if global_heap.len() >= NUM_LARGEST_ACCOUNTS {
+                                        if let Some(top) = global_heap.peek() {
+                                            if *top >= entry {
+                                                continue;
+                                            }
+                                        }
+                                        global_heap.pop();
+                                    }
+                                    global_heap.push(entry);
+                                }
                             }
-                            Err(e) => {
-                                warn!("Token cache warmer: scan failed for {}: {:?}", mint, e);
-                            }
-                        }
+                        });
+
+                        let token_balances: Vec<RpcTokenAccountBalance> = global_heap
+                            .into_sorted_vec()
+                            .into_iter()
+                            .map(|Reverse((amount, address))| RpcTokenAccountBalance {
+                                address: address.to_string(),
+                                amount: token_amount_to_ui_amount_v3(amount, &data),
+                            })
+                            .collect();
+
+                        let slot = bank.slot();
+                        cache.write().unwrap().set(*mint, slot, &token_balances);
+                        info!(
+                            "Token cache warmer: refreshed {} with {} accounts at slot {} (scanned {} total)",
+                            mint,
+                            token_balances.len(),
+                            slot,
+                            pubkeys.len()
+                        );
                     }
                     // Sleep for cache TTL before refreshing
                     thread::sleep(Duration::from_secs(30));

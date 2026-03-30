@@ -902,6 +902,18 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
         )
     }
 
+    /// Returns the list of pubkeys associated with a secondary index key.
+    /// This is a fast in-memory operation (no disk I/O) that reads from the secondary index.
+    /// Useful for parallel account loading patterns where callers want to load accounts
+    /// themselves across multiple threads.
+    pub fn get_indexed_keys(&self, index_key: &IndexKey) -> Vec<Pubkey> {
+        match index_key {
+            IndexKey::ProgramId(key) => self.program_id_index.get(key),
+            IndexKey::SplTokenMint(key) => self.spl_token_mint_index.get(key),
+            IndexKey::SplTokenOwner(key) => self.spl_token_owner_index.get(key),
+        }
+    }
+
     /// call func with every pubkey and index visible from a given set of ancestors
     pub(crate) fn index_scan_accounts<F>(
         &self,
