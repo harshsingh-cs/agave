@@ -3456,28 +3456,8 @@ impl AccountsDb {
             ancestors,
             bank_id,
             index_key,
-            data_size_filter,
+            _data_size_filter, // Not implemented - would require full storage scan per account
             |pubkey, (account_info, slot)| {
-                // If dataSize filter is present, check storage metadata before loading
-                if let Some(filter_size) = data_size_filter {
-                    // Try to get account metadata from storage without loading full data
-                    if let Some(storage) = self.storage.get_slot_storage_entry(slot) {
-                        // Scan storage to find this account's data_len
-                        let mut matches_data_size = false;
-                        let _ = storage.accounts.scan_accounts_without_data(|_offset, account| {
-                            if account.pubkey() == pubkey {
-                                matches_data_size = account.data_len as usize == filter_size;
-                            }
-                        });
-                        
-                        // Skip loading if data_size doesn't match
-                        if !matches_data_size {
-                            scan_func(None);
-                            return;
-                        }
-                    }
-                }
-                
                 let account_slot = self
                     .get_account_accessor(slot, pubkey, &account_info.storage_location())
                     .get_loaded_account(|loaded_account| {

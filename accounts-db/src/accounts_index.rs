@@ -921,12 +921,11 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
     pub(crate) fn index_scan_accounts<F>(
         &self,
         ancestors: &Ancestors,
-        scan_bank_id: BankId,
-        index_key: IndexKey,
-        _data_size_filter: Option<usize>, // Currently unused, passed for future optimization
-        func: F,
-        config: &ScanConfig,
-    ) -> Result<(), ScanError>
+        bank_id: BankId,
+        index_key: &IndexKey,
+        #[allow(unused)] _data_size_filter: Option<usize>, // Currently unused - optimization not viable
+        scan_func: F,
+    ) -> Result<()>
     where
         F: FnMut(&Pubkey, (&T, Slot)),
     {
