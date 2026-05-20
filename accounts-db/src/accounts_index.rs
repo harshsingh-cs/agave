@@ -923,6 +923,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
         ancestors: &Ancestors,
         scan_bank_id: BankId,
         index_key: IndexKey,
+        _data_size_filter: Option<usize>, // Currently unused, passed for future optimization
         func: F,
         config: &ScanConfig,
     ) -> Result<(), ScanError>

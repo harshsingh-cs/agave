@@ -420,6 +420,7 @@ impl Accounts {
         filter: F,
         config: &ScanConfig,
         byte_limit_for_scan: Option<usize>,
+        data_size_filter: Option<usize>,
     ) -> ScanResult<Vec<KeyedAccountSharedData>> {
         let sum = AtomicUsize::default();
         let config = config.recreate_with_abort();
@@ -430,6 +431,7 @@ impl Accounts {
                 ancestors,
                 bank_id,
                 *index_key,
+                data_size_filter,
                 |some_account_tuple| {
                     Self::load_while_filtering(&mut collector, some_account_tuple, |account| {
                         let use_account = filter(account);

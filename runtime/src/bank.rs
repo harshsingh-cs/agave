@@ -4664,6 +4664,7 @@ impl Bank {
         filter: F,
         config: &ScanConfig,
         byte_limit_for_scan: Option<usize>,
+        data_size_filter: Option<usize>,
     ) -> ScanResult<Vec<KeyedAccountSharedData>> {
         self.rc.accounts.load_by_index_key_with_filter(
             &self.ancestors,
@@ -4672,6 +4673,7 @@ impl Bank {
             filter,
             config,
             byte_limit_for_scan,
+            data_size_filter,
         )
     }
 

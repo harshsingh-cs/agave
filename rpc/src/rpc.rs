@@ -308,6 +308,15 @@ impl JsonRpcRequestProcessor {
         filters: Vec<RpcFilterType>,
         sort_results: bool,
     ) -> ScanResult<Vec<KeyedAccountSharedData>> {
+        // Extract dataSize filter for storage-level optimization
+        let data_size_filter = filters.iter().find_map(|f| {
+            if let RpcFilterType::DataSize(size) = f {
+                Some(*size as usize)
+            } else {
+                None
+            }
+        });
+
         let scan_order = if sort_results {
             ScanOrder::Sorted
         } else {
@@ -333,6 +342,7 @@ impl JsonRpcRequestProcessor {
                     },
                     &ScanConfig::new(scan_order),
                     bank.byte_limit_for_scans(),
+                    data_size_filter,
                 )
             })
             .await
