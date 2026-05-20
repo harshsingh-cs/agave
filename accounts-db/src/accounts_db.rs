@@ -3464,7 +3464,7 @@ impl AccountsDb {
                     if let Some(storage) = self.storage.get_slot_storage_entry(slot) {
                         // Scan storage to find this account's data_len
                         let mut matches_data_size = false;
-                        let _ = storage.accounts.scan_accounts_without_data(|offset, account| {
+                        let _ = storage.accounts.scan_accounts_without_data(|_offset, account| {
                             if account.pubkey() == pubkey {
                                 matches_data_size = account.data_len as usize == filter_size;
                             }
